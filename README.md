@@ -69,7 +69,7 @@ poetry run jupyter notebook notebooks/analysis.ipynb
 
 ## Authors
 
-- **Surya Jamuna Rani Subramaniyan** (S3664414)
-- **Sachin Ravi** (S3563545)
+- **Surya Jamuna Rani Subramaniyan** (S-3664414)
+- **Sachin Ravi** (S-3563545)
 
-Scientific Programming for Geospatial Sciences - ITC, University of Twente (2025)
+Course: Scientific Programming for Geospatial Sciences - ITC, University of Twente (2026)
