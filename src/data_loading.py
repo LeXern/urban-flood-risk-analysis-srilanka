@@ -13,7 +13,103 @@ import rioxarray  # noqa: F401 - needed for xarray rio accessor
 import geopandas as gpd
 import numpy as np
 from pathlib import Path
-from typing import Union, Optional
+from typing import Union, Optional, List
+import gzip
+import struct
+
+
+def load_srtm_tiles(
+    tile_dir: Union[str, Path],
+    bbox: Optional[tuple] = None
+) -> xr.DataArray:
+    """
+    Load SRTM DEM from multiple .hgt.gz tiles.
+    
+    Parameters
+    ----------
+    tile_dir : str or Path
+        Directory containing SRTM .hgt.gz files
+    bbox : tuple, optional
+        Bounding box to clip (west, south, east, north)
+    
+    Returns
+    -------
+    xr.DataArray
+        Merged elevation data
+    """
+    tile_dir = Path(tile_dir)
+    hgt_files = list(tile_dir.glob('*.hgt.gz')) + list(tile_dir.glob('*.hgt'))
+    
+    if not hgt_files:
+        raise FileNotFoundError(f"No SRTM tiles found in {tile_dir}")
+    
+    tiles = []
+    for hgt_file in sorted(hgt_files):
+        tile = _read_single_hgt(hgt_file)
+        if tile is not None:
+            tiles.append(tile)
+    
+    if not tiles:
+        raise ValueError("Could not read any SRTM tiles")
+    
+    # Merge tiles
+    merged = xr.concat(tiles, dim='y')
+    merged = merged.sortby('y', ascending=False)
+    merged = merged.sortby('x')
+    
+    # Clip to bbox if provided
+    if bbox is not None:
+        west, south, east, north = bbox
+        merged = merged.sel(x=slice(west, east), y=slice(north, south))
+    
+    merged.name = 'elevation'
+    return merged
+
+
+def _read_single_hgt(filepath: Path) -> xr.DataArray:
+    """Read a single SRTM HGT file (compressed or uncompressed)."""
+    # Parse coordinates from filename (e.g., N06E079.hgt.gz)
+    name = filepath.stem.replace('.hgt', '')
+    lat_char = name[0]  # N or S
+    lat = int(name[1:3])
+    lon_char = name[3]  # E or W
+    lon = int(name[4:7])
+    
+    if lat_char == 'S':
+        lat = -lat
+    if lon_char == 'W':
+        lon = -lon
+    
+    # Read file
+    try:
+        if filepath.suffix == '.gz':
+            with gzip.open(filepath, 'rb') as f:
+                data = f.read()
+        else:
+            with open(filepath, 'rb') as f:
+                data = f.read()
+        
+        # SRTM1 = 3601x3601, SRTM3 = 1201x1201
+        size = int(np.sqrt(len(data) / 2))
+        elevation = np.frombuffer(data, dtype='>i2').reshape((size, size))
+        
+        # Create coordinate arrays
+        lats = np.linspace(lat + 1, lat, size)
+        lons = np.linspace(lon, lon + 1, size)
+        
+        da = xr.DataArray(
+            data=elevation.astype(np.float32),
+            dims=['y', 'x'],
+            coords={'y': lats, 'x': lons}
+        )
+        
+        # Replace void values
+        da = da.where(da != -32768)
+        
+        return da
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}")
+        return None
 
 
 def load_chirps_data(
