@@ -240,6 +240,10 @@ def compare_numpy_vs_torch(
     """
     results = {}
     
+    # Handle xarray input
+    if hasattr(data, 'values'):
+        data = data.values
+    
     # ========== NumPy (scipy) approach ==========
     numpy_times = []
     for _ in range(num_iterations):
