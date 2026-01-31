@@ -11,6 +11,7 @@ Functions for loading various geospatial datasets:
 
 import xarray as xr
 import rioxarray  # noqa: F401
+from rioxarray.merge import merge_arrays
 import geopandas as gpd
 import pandas as pd
 import numpy as np
@@ -58,25 +59,22 @@ def load_srtm_tiles(
     if not tiles:
         raise ValueError("Could not read any SRTM tiles")
     
-    # Merge tiles
-    merged = xr.concat(tiles, dim='y')
-    merged = merged.sortby('y', ascending=False)
-    merged = merged.sortby('x')
-    
-    # helper: drop duplicates if any (common with tile overlap)
-    _, index = np.unique(merged['x'], return_index=True)
-    merged = merged.isel(x=index)
-    _, index = np.unique(merged['y'], return_index=True)
-    merged = merged.isel(y=index[::-1]) # Keep descending sort for y
+    # Merge tiles using rioxarray (handles 2D grid correctly)
+    try:
+        merged = merge_arrays(tiles)
+    except Exception as e:
+        print(f"Warning: merge_arrays failed ({e}), falling back to concat")
+        merged = xr.concat(tiles, dim='y')
+
+    # Assign CRS (SRTM is always WGS84)
+    merged.rio.write_crs("EPSG:4326", inplace=True)
     
     # Clip to bbox if provided
     if bbox is not None:
         west, south, east, north = bbox
-        merged = merged.sel(x=slice(west, east), y=slice(north, south))
+        merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north)
     
     merged.name = 'elevation'
-    # Assign CRS (SRTM is always WGS84)
-    merged.rio.write_crs("EPSG:4326", inplace=True)
     return merged
 
 
@@ -120,6 +118,9 @@ def _read_single_hgt(filepath: Path) -> xr.DataArray:
         # Replace void values
         da = da.where(da != -32768)
         
+        # Assign CRS explicitly to enable safe merging
+        da.rio.write_crs("EPSG:4326", inplace=True)
+        
         return da
     except Exception as e:
         print(f"Error reading {filepath}: {e}")
@@ -162,6 +163,12 @@ def load_chirps_data(
     if time_slice is not None:
         start_date, end_date = time_slice
         data = data.sel(time=slice(start_date, end_date))
+    
+    # data = data.sel(time=slice(start_date, end_date))
+    
+    # Assign CRS (CHIRPS is EPSG:4326)
+    if data.rio.crs is None:
+        data.rio.write_crs("EPSG:4326", inplace=True)
     
     return data
 

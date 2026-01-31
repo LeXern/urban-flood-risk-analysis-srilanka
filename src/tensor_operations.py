@@ -40,6 +40,9 @@ def numpy_to_tensor(
     >>> print(rainfall_tensor.device)
     """
     # convert to tensor
+    if hasattr(array, 'values'):
+        array = array.values
+        
     tensor = torch.tensor(array, dtype=torch.float32)
     
     # select device
