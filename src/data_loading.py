@@ -261,6 +261,7 @@ def load_osm_buildings(
                     
                     geoms.append(geom)
                     tags = el.get('tags', {})
+                    tags['building_id'] = el.get('id', 0)  # Inject ID
                     properties.append(tags)
             
             if not geoms:
