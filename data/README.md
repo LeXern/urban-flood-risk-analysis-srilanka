@@ -29,9 +29,9 @@ This directory contains the geospatial data files for flood vulnerability analys
 - **Resolution:** 30m
 - **Format:** GeoTIFF (.tif)
 
-### 3. Google Open Buildings
-- **Source:** https://sites.research.google/open-buildings/
-- **Region:** South Asia → Sri Lanka
+### 3. OpenStreetMap Buildings
+- **Source:** https://download.geofabrik.de/asia/sri-lanka.html or Overpass API
+- **Region:** Sri Lanka (Colombo District)
 - **Format:** CSV with WKT geometry
 - **Filter:** Clip to Colombo bounding box after download
 
