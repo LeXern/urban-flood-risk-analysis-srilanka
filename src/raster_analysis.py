@@ -7,9 +7,10 @@ Implements array-based masking, normalization, and temporal statistics.
 
 import numpy as np
 import xarray as xr
-from scipy.ndimage import uniform_filter, gaussian_filter
-from typing import Union, Optional, Tuple
+from scipy.ndimage import uniform_filter, gaussian_filter, distance_transform_edt
+from typing import Union, Optional, Tuple, Dict
 import geopandas as gpd
+import pandas as pd
 from shapely.geometry import mapping
 
 
@@ -73,11 +74,6 @@ def create_extreme_rainfall_mask(
     -------
     np.ndarray or xr.DataArray
         Boolean mask where True = extreme rainfall
-    
-    Example
-    -------
-    >>> extreme_mask = create_extreme_rainfall_mask(daily_rainfall, threshold=50)
-    >>> extreme_days_count = extreme_mask.sum(axis=0)  # count per pixel
     """
     # simple element-wise comparison - no loops needed
     mask = rainfall > threshold
@@ -135,11 +131,6 @@ def calculate_percentile_rainfall(
     -------
     np.ndarray or xr.DataArray
         2D array with percentile values
-    
-    Example
-    -------
-    >>> p95 = calculate_percentile_rainfall(annual_data, percentile=95)
-    >>> # p95 shows the 95th percentile rainfall for each location
     """
     if isinstance(rainfall, xr.DataArray):
         return rainfall.quantile(percentile / 100.0, dim='time')
@@ -165,11 +156,6 @@ def normalize_array(
     -------
     np.ndarray or xr.DataArray
         Normalized data
-    
-    Example
-    -------
-    >>> rainfall_norm = normalize_array(max_rainfall, method='minmax')
-    >>> # values now range from 0 to 1
     """
     if method == 'minmax':
         # min-max normalization to [0, 1]
@@ -209,11 +195,6 @@ def identify_low_elevation_areas(
     -------
     np.ndarray or xr.DataArray
         Boolean mask where True = low elevation area
-    
-    Example
-    -------
-    >>> low_areas = identify_low_elevation_areas(dem_data, percentile=25)
-    >>> # low_areas shows pixels in the lowest 25% elevation
     """
     threshold_value = np.nanpercentile(dem, percentile)
     low_mask = dem < threshold_value
@@ -238,13 +219,18 @@ def calculate_annual_maximum(
     -------
     xr.DataArray
         Annual maximum rainfall per year and location
-    
-    Example
-    -------
-    >>> annual_max = calculate_annual_maximum(daily_rainfall)
-    >>> # annual_max has dimensions (year, lat, lon)
     """
-    return rainfall.groupby(f'{dim}.year').max(dim=dim)
+    # Handle files with no 'year' group (e.g. single year data)
+    try:
+        if 'year' in rainfall.indexes[dim].names: # already multi-indexed
+           pass 
+        elif pd.api.types.is_datetime64_any_dtype(rainfall.indexes[dim]):
+           return rainfall.groupby(f'{dim}.year').max(dim=dim)
+        
+        # Fallback for simple index
+        return rainfall.max(dim=dim)
+    except:
+        return rainfall.max(dim=dim)
 
 
 def smooth_raster(
@@ -268,10 +254,6 @@ def smooth_raster(
     -------
     np.ndarray or xr.DataArray
         Smoothed raster
-    
-    Example
-    -------
-    >>> smoothed = smooth_raster(rainfall_max, method='gaussian', size=2)
     """
     # extract numpy array if xarray
     is_xarray = isinstance(data, xr.DataArray)
@@ -296,63 +278,182 @@ def smooth_raster(
     return smoothed
 
 
-def calculate_vulnerability_index(
-    rainfall_norm: np.ndarray,
-    building_density_norm: np.ndarray,
-    elevation_norm: np.ndarray,
-    weights: Tuple[float, float, float] = (0.4, 0.3, 0.3)
-) -> np.ndarray:
+def calculate_standardized_anomalies(
+    data: xr.DataArray,
+    dim: str = 'time'
+) -> xr.DataArray:
     """
-    Calculate composite vulnerability index.
-    
-    V = w1 * rainfall + w2 * building_density + w3 * (1 - elevation)
+    Calculate standardized anomalies (Z-scores) along a dimension.
+    z = (x - mean) / std
     
     Parameters
     ----------
-    rainfall_norm : np.ndarray
-        Normalized rainfall intensity (0-1)
-    building_density_norm : np.ndarray
-        Normalized building density (0-1)
-    elevation_norm : np.ndarray
-        Normalized elevation (0-1), will be inverted
-    weights : tuple
-        Weights for each component (must sum to 1)
+    data : xr.DataArray
+        Input data
+    dim : str
+        Dimension to calculate statistics over
+        
+    Returns
+    -------
+    xr.DataArray
+        Data converted to Z-scores
+    """
+    mean = data.mean(dim=dim)
+    std = data.std(dim=dim)
+    # Avoid division by zero
+    std = std.where(std != 0, 1.0)
+    anomalies = (data - mean) / std
+    return anomalies
+
+
+def calculate_slope(
+    dem: xr.DataArray,
+    pixel_size: float = 30.0
+) -> xr.DataArray:
+    """
+    Calculate terrain slope from DEM (simplified gradient method).
     
+    Parameters
+    ----------
+    dem : xr.DataArray
+        Elevation data
+    pixel_size : float
+        Pixel size in meters (e.g. 30m for SRTM)
+        
+    Returns
+    -------
+    xr.DataArray
+        Slope in degrees
+    """
+    # Guard for very small rasters (need at least 2 cells per dimension)
+    if dem.ndim != 2 or min(dem.shape) < 2:
+        return xr.zeros_like(dem, dtype=float)
+
+    # Calculate gradients in Y and X directions
+    # Note: np.gradient returns [dY, dX] for 2D array
+    dy, dx = np.gradient(dem.values, pixel_size)
+    
+    # Slope = arctan(sqrt(dx^2 + dy^2)) * (180/pi)
+    slope_rad = np.arctan(np.sqrt(dx**2 + dy**2))
+    slope_deg = np.degrees(slope_rad)
+    
+    return xr.DataArray(slope_deg, coords=dem.coords, dims=dem.dims)
+
+
+def calculate_euclidean_distance(
+    raster_shape: Tuple[int, int],
+    target_indices: Tuple[np.ndarray, np.ndarray],
+    pixel_size: float = 30.0
+) -> np.ndarray:
+    """
+    Calculate Euclidean distance from target pixels to all other pixels.
+    Uses SciPy's optimized distance_transform_edt.
+    
+    Parameters
+    ----------
+    raster_shape : tuple
+        Shape of the raster (height, width)
+    target_indices : tuple of arrays
+        (row_indices, col_indices) of the target feature (e.g. river pixels)
+    pixel_size : float
+        Resolution of pixels in meters (to convert pixel distance to meters)
+        
     Returns
     -------
     np.ndarray
-        Vulnerability index (0-1, higher = more vulnerable)
-    
-    Example
-    -------
-    >>> vulnerability = calculate_vulnerability_index(
-    ...     rainfall_norm, building_norm, elevation_norm,
-    ...     weights=(0.4, 0.3, 0.3)
-    ... )
+        Distance grid in meters
     """
-    w_rain, w_building, w_elev = weights
+    # Create boolean mask (0 = feature, 1 = background) for transform
+    # Note: distance_transform_edt calculates distance to nearest ZERO
+    mask = np.ones(raster_shape, dtype=int)
+    mask[target_indices] = 0
     
-    # invert elevation (lower elevation = higher vulnerability)
-    elevation_inverted = 1.0 - elevation_norm
+    # Calculate distance in pixel units
+    dist_pixels = distance_transform_edt(mask)
     
-    # weighted sum
+    # Convert to meters
+    dist_meters = dist_pixels * pixel_size
+    
+    return dist_meters
+
+
+def ahp_weighted_overlay(
+    layers: Dict[str, xr.DataArray],
+    weights: Dict[str, float]
+) -> xr.DataArray:
+    """
+    Perform Multi-Criteria Decision Analysis using Weighted Linear Combination.
+    Each layer is normalized (0-1) before weighting.
+    
+    Parameters
+    ----------
+    layers : dict
+        Dictionary of input rasters (name -> DataArray)
+    weights : dict
+        Dictionary of weights (name -> float). Should sum to 1.0.
+        
+    Returns
+    -------
+    xr.DataArray
+        Combined suitability/risk map (0-1 range)
+    """
+    combined = None
+    
+    for name, layer in layers.items():
+        if name not in weights:
+            continue
+            
+        # Normalize layer to 0-1
+        norm_layer = normalize_array(layer, method='minmax')
+        
+        weight = weights[name]
+        
+        if combined is None:
+            combined = norm_layer * weight
+        else:
+            combined += norm_layer * weight
+            
+    return combined
+
+
+def calculate_vulnerability_index(
+    rainfall: Union[np.ndarray, xr.DataArray],
+    building_density: Union[np.ndarray, xr.DataArray],
+    elevation: Union[np.ndarray, xr.DataArray],
+    weights: Tuple[float, float, float] = (1/3, 1/3, 1/3)
+) -> Union[np.ndarray, xr.DataArray]:
+    """
+    Combine normalized hazard/exposure components into a single vulnerability index.
+
+    Parameters
+    ----------
+    rainfall : np.ndarray or xr.DataArray
+        Normalized rainfall intensity (0-1, higher = more hazardous)
+    building_density : np.ndarray or xr.DataArray
+        Normalized building/urban density (0-1, higher = more exposed)
+    elevation : np.ndarray or xr.DataArray
+        Normalized elevation (0-1, higher = safer). Will be inverted internally.
+    weights : tuple of floats
+        Weights for (rainfall, building_density, elevation). Should sum to 1.
+
+    Returns
+    -------
+    np.ndarray or xr.DataArray
+        Vulnerability index in range [0, 1]
+    """
+    if len(weights) != 3:
+        raise ValueError("weights must be a tuple of three values (rainfall, building, elevation)")
+
+    w_rain, w_build, w_elev = weights
+
+    # Invert elevation so low-lying areas get higher vulnerability
+    inv_elevation = 1 - elevation
+
+    # Weighted linear combination; works for both numpy arrays and xarray DataArrays
     vulnerability = (
-        w_rain * rainfall_norm +
-        w_building * building_density_norm +
-        w_elev * elevation_inverted
+        (rainfall * w_rain) +
+        (building_density * w_build) +
+        (inv_elevation * w_elev)
     )
-    
+
     return vulnerability
-
-
-if __name__ == "__main__":
-    print("Raster analysis module loaded successfully")
-    print("Available functions:")
-    print("  - create_extreme_rainfall_mask()")
-    print("  - count_extreme_events()")
-    print("  - calculate_percentile_rainfall()")
-    print("  - normalize_array()")
-    print("  - identify_low_elevation_areas()")
-    print("  - calculate_annual_maximum()")
-    print("  - smooth_raster()")
-    print("  - calculate_vulnerability_index()")
