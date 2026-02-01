@@ -40,6 +40,9 @@ urban-flood-risk-analysis/
 # install dependencies
 poetry install
 
+# register jupyter kernel
+poetry run python -m ipykernel install --user --name urban-flood-analysis --display-name "Python (Urban Flood Analysis)"
+
 # activate virtual environment
 poetry shell
 
@@ -71,6 +74,7 @@ Run the main analysis notebook:
 ```bash
 poetry run jupyter notebook notebooks/analysis.ipynb
 ```
+*Note: Once the notebook is open, ensure you select the **"Python (Urban Flood Analysis)"** kernel from the top-right menu.*
 
 ## Authors
 
