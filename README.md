@@ -21,6 +21,7 @@ urban-flood-risk-analysis/
 │   ├── tensor_operations.py # PyTorch tensor processing
 │   ├── vector_analysis.py  # GeoPandas/Shapely operations
 │   ├── integration.py      # Raster-vector integration
+
 │   └── visualization.py    # Maps and charts
 ├── notebooks/              # Jupyter analysis notebook
 │   └── analysis.ipynb      # Main analysis workflow
