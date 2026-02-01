@@ -1,7 +1,7 @@
 # Urban Flood Vulnerability Assessment - Colombo District, Sri Lanka
 
 A scientific programming project for flood vulnerability mapping in **Colombo District**, 
-combining CHIRPS rainfall data, SRTM elevation data, and Google Building footprints.
+combining CHIRPS rainfall data, SRTM elevation data, and OpenStreetMap Building footprints.
 
 **Study Area:** Colombo District, Sri Lanka
 - Bounding Box: 79.82°E - 80.22°E, 6.75°N - 7.05°N
