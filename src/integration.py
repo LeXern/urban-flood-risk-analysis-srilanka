@@ -56,12 +56,51 @@ def extract_zonal_statistics(
     ... )
     >>> # districts now has 'rainfall_mean' and 'rainfall_max' columns
     """
-    # calculate zonal stats
+    raster_path = Path(raster_path)
+
+    # Open raster once to grab CRS/bounds; clip and reproject vector to avoid zero-sized windows
+    with rasterio.open(raster_path) as src:
+        raster_crs = src.crs
+        bounds = src.bounds
+        data = src.read(1)
+        res_x = abs(src.transform.a)
+        res_y = abs(src.transform.e)
+        nodata = src.nodata if src.nodata is not None else -9999
+
+        # Normalize bounds so min < max
+        minx, maxx = sorted([bounds.left, bounds.right])
+        miny, maxy = sorted([bounds.bottom, bounds.top])
+
+        # If raster is south-up (positive y pixel size), flip to north-up for rasterstats
+        from rasterio.transform import from_origin
+        if src.transform.e > 0:
+            data = data[::-1, :]
+        transform = from_origin(minx, maxy, res_x, res_y)
+
+    gdf = vector.copy()
+
+    # Reproject to raster CRS if needed
+    if gdf.crs is not None and raster_crs is not None and gdf.crs != raster_crs:
+        gdf = gdf.to_crs(raster_crs)
+
+    # Clip geometries to raster extent to prevent empty windows
+    from shapely.geometry import box
+    raster_bounds_geom = gpd.GeoSeries([box(minx, miny, maxx, maxy)], crs=raster_crs)
+    gdf = gpd.clip(gdf, raster_bounds_geom)
+    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notnull()]
+
+    if gdf.empty:
+        raise ValueError("No vector features overlap the raster extent; cannot compute zonal statistics.")
+
+    # calculate zonal stats using in-memory array to avoid malformed transforms
     zone_stats = zonal_stats(
-        vector.geometry,
-        str(raster_path),
+        gdf.geometry,
+        data,
+        affine=transform,
         stats=stats,
-        nodata=-9999
+        nodata=nodata,
+        all_touched=True,
+        boundless=True
     )
     
     # convert to dataframe and add prefix

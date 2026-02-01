@@ -4,16 +4,127 @@ Data Loading Module
 Functions for loading various geospatial datasets:
 - CHIRPS rainfall data (NetCDF)
 - SRTM DEM (GeoTIFF)
-- Google Building footprints (GeoJSON)
 - OpenStreetMap features (Shapefile/GeoPackage)
 """
 
+
+
 import xarray as xr
-import rioxarray  # noqa: F401 - needed for xarray rio accessor
+import rioxarray  # noqa: F401
+from rioxarray.merge import merge_arrays
 import geopandas as gpd
+import pandas as pd
 import numpy as np
+from shapely.geometry import box, shape
 from pathlib import Path
-from typing import Union, Optional
+from typing import Union, Optional, List
+import gzip
+import struct
+import requests
+import json
+import shutil
+
+
+def load_srtm_tiles(
+    tile_dir: Union[str, Path],
+    bbox: Optional[tuple] = None
+) -> xr.DataArray:
+    """
+    Load SRTM DEM from multiple .hgt.gz tiles.
+    
+    Parameters
+    ----------
+    tile_dir : str or Path
+        Directory containing SRTM .hgt.gz files
+    bbox : tuple, optional
+        Bounding box to clip (west, south, east, north)
+    
+    Returns
+    -------
+    xr.DataArray
+        Merged elevation data
+    """
+    tile_dir = Path(tile_dir)
+    hgt_files = list(tile_dir.glob('*.hgt.gz')) + list(tile_dir.glob('*.hgt'))
+    
+    if not hgt_files:
+        raise FileNotFoundError(f"No SRTM tiles found in {tile_dir}")
+    
+    tiles = []
+    for hgt_file in sorted(hgt_files):
+        tile = _read_single_hgt(hgt_file)
+        if tile is not None:
+            tiles.append(tile)
+    
+    if not tiles:
+        raise ValueError("Could not read any SRTM tiles")
+    
+    # Merge tiles using rioxarray (handles 2D grid correctly)
+    try:
+        merged = merge_arrays(tiles)
+    except Exception as e:
+        print(f"Warning: merge_arrays failed ({e}), falling back to concat")
+        merged = xr.concat(tiles, dim='y')
+
+    # Assign CRS (SRTM is always WGS84)
+    merged.rio.write_crs("EPSG:4326", inplace=True)
+    
+    # Clip to bbox if provided
+    if bbox is not None:
+        west, south, east, north = bbox
+        merged = merged.rio.clip_box(minx=west, miny=south, maxx=east, maxy=north)
+    
+    merged.name = 'elevation'
+    return merged
+
+
+def _read_single_hgt(filepath: Path) -> xr.DataArray:
+    """Read a single SRTM HGT file (compressed or uncompressed)."""
+    # Parse coordinates from filename (e.g., N06E079.hgt.gz)
+    name = filepath.stem.replace('.hgt', '')
+    lat_char = name[0]  # N or S
+    lat = int(name[1:3])
+    lon_char = name[3]  # E or W
+    lon = int(name[4:7])
+    
+    if lat_char == 'S':
+        lat = -lat
+    if lon_char == 'W':
+        lon = -lon
+    
+    # Read file
+    try:
+        if filepath.suffix == '.gz':
+            with gzip.open(filepath, 'rb') as f:
+                data = f.read()
+        else:
+            with open(filepath, 'rb') as f:
+                data = f.read()
+        
+        # SRTM1 = 3601x3601, SRTM3 = 1201x1201
+        size = int(np.sqrt(len(data) / 2))
+        elevation = np.frombuffer(data, dtype='>i2').reshape((size, size))
+        
+        # Create coordinate arrays
+        lats = np.linspace(lat + 1, lat, size)
+        lons = np.linspace(lon, lon + 1, size)
+        
+        da = xr.DataArray(
+            data=elevation.astype(np.float32),
+            dims=['y', 'x'],
+            coords={'y': lats, 'x': lons}
+        )
+        
+        # Replace void values
+        da = da.where(da != -32768)
+        
+        # Assign CRS explicitly to enable safe merging
+        da.rio.write_crs("EPSG:4326", inplace=True)
+        
+        return da
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}")
+        return None
 
 
 def load_chirps_data(
@@ -52,6 +163,12 @@ def load_chirps_data(
     if time_slice is not None:
         start_date, end_date = time_slice
         data = data.sel(time=slice(start_date, end_date))
+    
+    # data = data.sel(time=slice(start_date, end_date))
+    
+    # Assign CRS (CHIRPS is EPSG:4326)
+    if data.rio.crs is None:
+        data.rio.write_crs("EPSG:4326", inplace=True)
     
     return data
 
@@ -92,44 +209,76 @@ def load_dem(
     return dem
 
 
-def load_buildings(
+
+def load_osm_buildings(
     filepath: Union[str, Path],
-    bbox: Optional[tuple] = None,
-    confidence_threshold: float = 0.7
+    bbox: Optional[tuple] = None
 ) -> gpd.GeoDataFrame:
     """
-    Load Google Building footprints from GeoJSON.
+    Load buildings from OpenStreetMap/Overpass GeoJSON.
     
     Parameters
     ----------
     filepath : str or Path
-        Path to the buildings GeoJSON file
+        Path to the OSM buildings GeoJSON file
     bbox : tuple, optional
         Bounding box filter (minx, miny, maxx, maxy)
-    confidence_threshold : float
-        Minimum confidence score to include (default: 0.7)
     
     Returns
     -------
     gpd.GeoDataFrame
         Building footprints as polygons
-    
-    Example
-    -------
-    >>> buildings = load_buildings('data/google_buildings_lk.geojson')
-    >>> print(f"Loaded {len(buildings)} buildings")
     """
-    # load with optional bbox filter
-    if bbox is not None:
-        buildings = gpd.read_file(filepath, bbox=bbox)
-    else:
-        buildings = gpd.read_file(filepath)
-    
-    # filter by confidence if column exists
-    if 'confidence' in buildings.columns:
-        buildings = buildings[buildings['confidence'] >= confidence_threshold]
-    
-    return buildings
+    try:
+        if bbox is not None:
+            return gpd.read_file(filepath, bbox=bbox)
+        else:
+            return gpd.read_file(filepath)
+    except Exception:
+        # Fallback for raw Overpass JSON
+        try:
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+            
+            elements = data.get('elements', [])
+            if not elements:
+                return gpd.GeoDataFrame(columns=['geometry'], crs="EPSG:4326")
+                
+            # Convert Overpass elements to GeoDataFrame
+            # Overpass 'way' with 'geometry' (list of lat/lon) -> Polygon
+            from shapely.geometry import Polygon, LineString
+            
+            geoms = []
+            properties = []
+            
+            for el in elements:
+                if 'geometry' in el:
+                    coords = [(pt['lon'], pt['lat']) for pt in el['geometry']]
+                    if len(coords) < 3:
+                        geom = LineString(coords) # Fallback if not closed
+                    else:
+                        geom = Polygon(coords)
+                    
+                    geoms.append(geom)
+                    tags = el.get('tags', {})
+                    tags['building_id'] = el.get('id', 0)  # Inject ID
+                    properties.append(tags)
+            
+            if not geoms:
+                 return gpd.GeoDataFrame(columns=['geometry'], crs="EPSG:4326")
+                 
+            gdf = gpd.GeoDataFrame(properties, geometry=geoms, crs="EPSG:4326")
+            
+            if bbox:
+                 minx, miny, maxx, maxy = bbox
+                 gdf = gdf.cx[minx:maxx, miny:maxy]
+                 
+            return gdf
+            
+        except Exception as e:
+            print(f"Error parsing OSM JSON: {e}")
+            return gpd.GeoDataFrame(columns=['geometry'], crs="EPSG:4326")
+
 
 
 def load_osm_roads(
@@ -156,7 +305,41 @@ def load_osm_roads(
     >>> roads = load_osm_roads('data/osm_roads.shp', road_types=['primary', 'secondary'])
     >>> print(f"Loaded {len(roads)} road segments")
     """
-    roads = gpd.read_file(filepath)
+    filepath = Path(filepath)
+    try:
+        roads = gpd.read_file(filepath)
+    except Exception:
+        # Fallback for raw Overpass JSON (like buildings loader)
+        try:
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+            elements = data.get('elements', [])
+            if not elements:
+                return gpd.GeoDataFrame(columns=['geometry'], crs="EPSG:4326")
+
+            from shapely.geometry import LineString
+
+            geoms = []
+            properties = []
+            for el in elements:
+                geom_coords = el.get('geometry')
+                if not geom_coords:
+                    continue
+                coords = [(pt['lon'], pt['lat']) for pt in geom_coords]
+                if len(coords) < 2:
+                    continue  # need at least 2 points for a LineString
+                geoms.append(LineString(coords))
+                tags = el.get('tags', {})
+                tags['road_id'] = el.get('id', 0)
+                properties.append(tags)
+
+            if not geoms:
+                return gpd.GeoDataFrame(columns=['geometry'], crs="EPSG:4326")
+
+            roads = gpd.GeoDataFrame(properties, geometry=geoms, crs="EPSG:4326")
+        except Exception as e:
+            print(f"Error parsing OSM roads JSON: {e}")
+            return gpd.GeoDataFrame(columns=['geometry'], crs="EPSG:4326")
     
     # filter by road type if specified
     if road_types is not None and 'highway' in roads.columns:
@@ -230,13 +413,187 @@ def validate_crs_match(
     return len(set(crs_list)) <= 1
 
 
+
+
+def download_file(url: str, dest_path: Path):
+    """Helper to download a file with progress."""
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    with open(dest_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+
+def download_osm_buildings(
+    bbox: dict,
+    output_path: Union[str, Path]
+) -> gpd.GeoDataFrame:
+    """
+    Download buildings from Overpass API and save to disk.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = f"""
+    [out:json][timeout:180];
+    (
+      way["building"]({bbox['south']},{bbox['west']},{bbox['north']},{bbox['east']});
+      relation["building"]({bbox['south']},{bbox['west']},{bbox['north']},{bbox['east']});
+    );
+    out geom;
+    """
+    print(f"Requesting Buildings from Overpass API...")
+    try:
+        response = requests.post(overpass_url, data={'data': query}, timeout=300)
+        response.raise_for_status()
+        
+        # Save Raw JSON
+        with open(output_path, 'w') as f:
+            json.dump(response.json(), f)
+            
+        print(f"Downloaded raw buildings to {output_path}")
+        
+        # Load it
+        return load_osm_buildings(output_path)
+        
+    except Exception as e:
+        print(f"Download failed: {e}")
+        return gpd.GeoDataFrame(columns=['geometry'], crs="EPSG:4326")
+
+
+
+def download_srtm(
+    bbox: dict,
+    cache_dir: Union[str, Path]
+) -> xr.DataArray:
+    """
+    Download SRTM Data.
+    Attempts to download real SRTM 90m data from CGIAR-CSI (public).
+    Tile srtm_44_09 covers Sri Lanka.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # CGIAR Tile for Sri Lanka (Lat 5-10N, Lon 75-80E -> 52_11)
+    tile_url = "https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_5x5/TIFF/srtm_52_11.zip"
+    zip_path = cache_dir / "srtm_52_11.zip"
+    tif_path = cache_dir / "srtm_52_11.tif"
+    
+    # 1. Download Zip
+    if not zip_path.exists() and not tif_path.exists():
+        print(f"Downloading Real SRTM (CGIAR 90m) from {tile_url}...")
+        try:
+            download_file(tile_url, zip_path)
+            print("Download complete.")
+        except Exception as e:
+            print(f"SRTM download failed: {e}")
+            return None
+
+    # 2. Extract
+    import zipfile
+    if not tif_path.exists():
+        if zip_path.exists():
+             print("Extracting SRTM...")
+             try:
+                 with zipfile.ZipFile(zip_path, 'r') as z:
+                     z.extractall(cache_dir)
+                 print("Extraction complete.")
+             except Exception as e:
+                 print(f"Extraction failed: {e}")
+                 return None
+        else:
+             print("Zip file missing.")
+             return None
+
+    # 3. Load & Clip
+    # The extracted file should be srtm_44_09.tif
+    if tif_path.exists():
+        # Load full tile
+        da = load_dem(tif_path)
+        
+        # Assign CRS if missing (CGIAR usually 4326)
+        if da.rio.crs is None:
+            da.rio.write_crs("EPSG:4326", inplace=True)
+            
+        # Clip to Colombo BBox
+        # Note: BBox is small compared to tile, so clipping is efficient
+        minx, miny, maxx, maxy = bbox['west'], bbox['south'], bbox['east'], bbox['north']
+        da_clipped = da.rio.clip_box(minx=minx, miny=miny, maxx=maxx, maxy=maxy)
+        
+        # Save clipped version for speed?
+        # optional
+        
+        return da_clipped
+    else:
+        print("SRTM TIF not found after extraction.")
+        return None
+
+
+def download_osm_roads(
+    bbox: dict,
+    output_path: Union[str, Path],
+    highway_types: Optional[list] = None
+) -> gpd.GeoDataFrame:
+    """
+    Download OSM roads via Overpass and save to disk.
+
+    Parameters
+    ----------
+    bbox : dict
+        Bounding box with keys west, east, south, north
+    output_path : str or Path
+        Destination JSON path
+    highway_types : list, optional
+        Filter highway tags (e.g., ['primary','secondary'])
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+        Roads as LineStrings
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    # build type filter
+    type_filter = ""
+    if highway_types:
+        filters = "|".join(highway_types)
+        type_filter = f'["highway"~"{filters}"]'
+    else:
+        type_filter = '["highway"]'
+
+    query = f"""
+    [out:json][timeout:300];
+    (
+      way{type_filter}({bbox['south']},{bbox['west']},{bbox['north']},{bbox['east']});
+      relation{type_filter}({bbox['south']},{bbox['west']},{bbox['north']},{bbox['east']});
+    );
+    out geom;
+    """
+    print("Requesting roads from Overpass API...")
+    try:
+        response = requests.post(overpass_url, data={'data': query}, timeout=600)
+        response.raise_for_status()
+        data = response.json()
+
+        with open(output_path, 'w') as f:
+            json.dump(data, f)
+
+        print(f"Downloaded raw roads to {output_path}")
+        return load_osm_roads(output_path)
+    except Exception as e:
+        print(f"Download failed: {e}")
+        return gpd.GeoDataFrame(columns=['geometry'], crs="EPSG:4326")
+
 if __name__ == "__main__":
     # quick test
     print("Data loading module loaded successfully")
     print("Available functions:")
     print("  - load_chirps_data()")
     print("  - load_dem()")
-    print("  - load_buildings()")
+    print("  - load_osm_buildings()")
     print("  - load_osm_roads()")
     print("  - load_admin_boundaries()")
     print("  - validate_crs_match()")

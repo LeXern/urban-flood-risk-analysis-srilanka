@@ -40,6 +40,9 @@ def numpy_to_tensor(
     >>> print(rainfall_tensor.device)
     """
     # convert to tensor
+    if hasattr(array, 'values'):
+        array = array.values
+        
     tensor = torch.tensor(array, dtype=torch.float32)
     
     # select device
@@ -236,6 +239,10 @@ def compare_numpy_vs_torch(
     >>> print(f"Speedup: {results['speedup']:.2f}x")
     """
     results = {}
+    
+    # Handle xarray input
+    if hasattr(data, 'values'):
+        data = data.values
     
     # ========== NumPy (scipy) approach ==========
     numpy_times = []
